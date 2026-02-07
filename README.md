@@ -18,17 +18,7 @@ Automatically exports all CloudWatch Log Groups to S3 on a recurring schedule. D
 
 ## Architecture
 
-```
-EventBridge Rule (hourly)
-        |
-        v
-Step Functions State Machine
-        |
-        ├── DescribeLogGroups (paginated)
-        |
-        └── For each log group (sequential):
-                └── CreateExportTask --> S3 Bucket (KMS encrypted)
-```
+![State Machine](images/statemachine.png)
 
 The state machine:
 1. Calculates the time range for the previous hour
