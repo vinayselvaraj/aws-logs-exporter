@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Log Exporter'
+Description: 'CloudWatch Logs to S3 Exporter'
 
 Parameters:
   BucketPrefix:
