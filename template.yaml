@@ -1,0 +1,352 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudWatch Logs to S3 Exporter'
+
+Parameters:
+  BucketPrefix:
+    Type: String
+    Default: 'logs'
+    Description: 'Prefix for the S3 bucket name (bucket will be named <prefix>-<account-id>-<region>)'
+
+  ExpirationInDays:
+    Type: Number
+    Default: 30
+    Description: 'Number of days before exported log objects expire from S3'
+
+  KmsKeyAliasName:
+    Type: String
+    Default: 'alias/logs-bucket-key'
+    Description: 'Alias name for the KMS key used to encrypt the S3 bucket'
+
+  ScheduleExpression:
+    Type: String
+    Default: 'rate(1 hour)'
+    Description: 'EventBridge schedule expression for triggering log exports'
+
+  StateMachineLogLevel:
+    Type: String
+    Default: 'ALL'
+    AllowedValues:
+      - 'ALL'
+      - 'ERROR'
+      - 'FATAL'
+      - 'OFF'
+    Description: 'Logging level for the Step Functions state machine'
+
+  StateMachineLogRetentionInDays:
+    Type: Number
+    Default: 1
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    Description: 'Retention in days for the Step Functions state machine log group'
+
+Resources:
+  LogsKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for encrypting CloudWatch Logs exports in S3
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:CreateGrant
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+          - Sid: Allow S3 to use the key
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+
+  LogsKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Ref KmsKeyAliasName
+      TargetKeyId: !Ref LogsKmsKey
+
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${BucketPrefix}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt LogsKmsKey.Arn
+            BucketKeyEnabled: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireObjectsAfter30Days
+            Status: Enabled
+            ExpirationInDays: !Ref ExpirationInDays
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  LogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowLogsServiceAccess
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - s3:GetBucketAcl
+              - s3:PutObject
+            Resource:
+              - !GetAtt LogsBucket.Arn
+              - !Sub '${LogsBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+  # Step Functions State Machine for Log Export
+  LogExportStateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /stepfunctions/states/LogExportWorkflow-Logs
+      RetentionInDays: !Ref StateMachineLogRetentionInDays
+
+  LogExportStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-LogExportSMRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LogExportPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:DescribeLogGroups
+                  - logs:CreateExportTask
+                Resource: '*'
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !GetAtt LogExportStateMachineLogGroup.Arn
+
+  LogExportStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: LogExportStateMachine
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt LogExportStateMachineRole.Arn
+      DefinitionString: !Sub |-
+        {
+          "Comment": "Export CloudWatch Logs to S3 for all log groups",
+          "QueryLanguage": "JSONata",
+          "StartAt": "CalculateTimeRange",
+          "States": {
+            "CalculateTimeRange": {
+              "Type": "Pass",
+              "Assign": {
+                "endTime": "{% $floor($toMillis($now()) / 3600000) * 3600000 %}",
+                "startTime": "{% $floor($toMillis($now()) / 3600000) * 3600000 - 3600000 %}",
+                "allLogGroups": []
+              },
+              "Next": "ListLogGroups"
+            },
+            "ListLogGroups": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:cloudwatchlogs:describeLogGroups",
+              "Arguments": {},
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Assign": {
+                "allLogGroups": "{% $append($allLogGroups, $states.result.LogGroups) %}",
+                "nextToken": "{% $exists($states.result.NextToken) ? $states.result.NextToken : null %}"
+              },
+              "Next": "CheckMoreLogGroups"
+            },
+            "CheckMoreLogGroups": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Condition": "{% $exists($nextToken) and $nextToken != null %}",
+                  "Next": "ListMoreLogGroups"
+                }
+              ],
+              "Default": "ExportLogGroups"
+            },
+            "ListMoreLogGroups": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:cloudwatchlogs:describeLogGroups",
+              "Arguments": {
+                "NextToken": "{% $nextToken %}"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Assign": {
+                "allLogGroups": "{% $append($allLogGroups, $states.result.LogGroups) %}",
+                "nextToken": "{% $exists($states.result.NextToken) ? $states.result.NextToken : null %}"
+              },
+              "Next": "CheckMoreLogGroups"
+            },
+            "ExportLogGroups": {
+              "Type": "Map",
+              "Items": "{% $allLogGroups %}",
+              "MaxConcurrency": 1,
+              "ItemProcessor": {
+                "ProcessorConfig": {
+                  "Mode": "INLINE"
+                },
+                "StartAt": "CreateExportTask",
+                "States": {
+                  "CreateExportTask": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:cloudwatchlogs:createExportTask",
+                    "Arguments": {
+                      "LogGroupName": "{% $states.input.LogGroupName %}",
+                      "From": "{% $startTime %}",
+                      "To": "{% $endTime %}",
+                      "Destination": "${LogsBucket}",
+                      "DestinationPrefix": "{% $fromMillis($startTime, '[Y0001]_[M01]_[D01]') & '/' & $fromMillis($startTime, '[H01]') & '/' & $replace($replace($replace($states.input.LogGroupName, /^\\//, ''), /\\/$/, ''), '/', '_') %}"
+                    },
+                    "Retry": [
+                      {
+                        "ErrorEquals": ["CloudWatchLogs.LimitExceededException"],
+                        "IntervalSeconds": 15,
+                        "MaxAttempts": 8,
+                        "BackoffRate": 2.0,
+                        "JitterStrategy": "FULL"
+                      },
+                      {
+                        "ErrorEquals": ["States.ALL"],
+                        "IntervalSeconds": 5,
+                        "MaxAttempts": 3,
+                        "BackoffRate": 2.0
+                      }
+                    ],
+                    "Catch": [
+                      {
+                        "ErrorEquals": ["States.ALL"],
+                        "Next": "LogExportError"
+                      }
+                    ],
+                    "End": true
+                  },
+                  "LogExportError": {
+                    "Type": "Pass",
+                    "End": true
+                  }
+                }
+              },
+              "Next": "Done"
+            },
+            "Done": {
+              "Type": "Succeed"
+            }
+          }
+        }
+      LoggingConfiguration:
+        Level: !Ref StateMachineLogLevel
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt LogExportStateMachineLogGroup.Arn
+
+  LogExportStateMachineScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-HourlyLogExportSM'
+      Description: Trigger log export state machine every hour
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !Ref LogExportStateMachine
+          Id: LogExportStateMachineTarget
+          RoleArn: !GetAtt LogExportStateMachineEventBridgeRole.Arn
+
+  LogExportStateMachineEventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-LogExportSMEBRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeStateMachinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref LogExportStateMachine
+
+Outputs:
+  BucketName:
+    Description: 'Name of the S3 logs bucket'
+    Value: !Ref LogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+
+  BucketArn:
+    Description: 'ARN of the S3 logs bucket'
+    Value: !GetAtt LogsBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketArn'
